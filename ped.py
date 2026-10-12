@@ -19,7 +19,7 @@
 # =====================================================================
 
 # --- 1. UVOZ BIBLIOTEKA ---
-import json, os, re, sys, subprocess, unicodedata, zipfile
+import json, os, re, sys, subprocess, unicodedata, zipfile, shutil, base64, hashlib, secrets, tempfile
 import xml.etree.ElementTree as ET
 # --- WINDOWS HIGH-DPI / BLUR FIX ---
 # Mora se pokrenuti prije kreiranja prvog Tk prozora.
@@ -52,7 +52,9 @@ except ImportError:
 
 # --- PUTANJE DO FAJLOVA SA PODACIMA (oba su u korisničkom folderu) ---
 # Ovdje su unosi i tipovi događaja:
-FILE = os.path.join(os.path.expanduser("~"), "school_log.json")
+FILE = os.path.join(os.path.expanduser("~"), "school_log.ped")
+LEGACY_FILE = os.path.join(os.path.expanduser("~"), "school_log.json")
+SECURITY_FILE = os.path.join(os.path.expanduser("~"), "pedagog_asistent_security.json")
 # Ovdje je tekst zakona i pravilnika:
 LAWS_FILE = os.path.join(os.path.expanduser("~"), "pedagog_asistent_laws.json")
 
@@ -203,13 +205,136 @@ EXTRA_SHORTCUTS = [
 ]
 
 
-# Učitava unose i tipove događaja iz school_log.json (ili početne vrijednosti).
-def load():
-    try:
-        with open(FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return json.loads(json.dumps(DEFAULT))
+# =====================================================================
+# 3b. SIGURNOST – prijava, password hashing i enkripcija dnevnika
+# =====================================================================
+# Za enkripciju je potreban paket:  pip install cryptography
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+except ImportError:
+    Fernet = InvalidToken = None
+
+
+def _password_key(password, salt):
+    """Spori password-derived key (scrypt), pogodan za zaštitu lokalne aplikacije."""
+    raw = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2**14, r=8, p=1, dklen=32)
+    return base64.urlsafe_b64encode(raw)
+
+
+def _require_crypto():
+    if Fernet is None:
+        raise RuntimeError("Missing security package. Run: pip install cryptography")
+
+
+def _read_security():
+    if not os.path.exists(SECURITY_FILE):
+        return None
+    with open(SECURITY_FILE, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _write_security(obj):
+    tmp = SECURITY_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
+    os.replace(tmp, SECURITY_FILE)
+
+
+def setup_or_login(parent):
+    """Prikaže login/setup. Vraća Fernet objekt za sesiju ili None."""
+    _require_crypto()
+    security = _read_security()
+    result = {"fernet": None, "username": None}
+    w = tk.Toplevel(parent)
+    w.title("Pedagog Asistent – prijava")
+    w.configure(bg=BG, padx=28, pady=24)
+    w.resizable(False, False)
+    w.protocol("WM_DELETE_WINDOW", lambda: (result.update(fernet=None), w.destroy()))
+    w.grab_set()
+
+    first_run = security is None
+    title = "Kreiranje naloga" if first_run else "Prijava u Pedagog Asistent"
+    tk.Label(w, text="🔐 " + title, bg=BG, fg=TEXT, font=("Segoe UI", 17, "bold")).grid(
+        row=0, column=0, columnspan=2, pady=(0, 16))
+    tk.Label(w, text="Korisničko ime", bg=BG, fg=TEXT).grid(row=1, column=0, sticky="w", pady=5)
+    username = tk.StringVar(value="admin" if first_run else "")
+    tk.Entry(w, textvariable=username, width=30, relief="flat").grid(row=1, column=1, pady=5)
+    tk.Label(w, text="Lozinka", bg=BG, fg=TEXT).grid(row=2, column=0, sticky="w", pady=5)
+    password = tk.StringVar()
+    pe = tk.Entry(w, textvariable=password, width=30, show="•", relief="flat")
+    pe.grid(row=2, column=1, pady=5)
+    confirm = tk.StringVar()
+    if first_run:
+        tk.Label(w, text="Ponovi lozinku", bg=BG, fg=TEXT).grid(row=3, column=0, sticky="w", pady=5)
+        tk.Entry(w, textvariable=confirm, width=30, show="•", relief="flat").grid(row=3, column=1, pady=5)
+        note = "Ovo je glavni lokalni nalog. Lozinka se ne čuva u čitljivom obliku."
+        button_row = 4
+    else:
+        note = "Dnevnik je enkriptovan; bez ispravne lozinke podaci se ne mogu otvoriti."
+        button_row = 3
+    tk.Label(w, text=note, bg=BG, fg="#806b79", wraplength=390, justify="left").grid(
+        row=button_row, column=0, columnspan=2, pady=(10, 12))
+
+    def ok():
+        u, pw = username.get().strip(), password.get()
+        if not u or len(pw) < 8:
+            return messagebox.showerror("Prijava", "Unesite korisničko ime i lozinku od najmanje 8 znakova.", parent=w)
+        try:
+            if first_run:
+                if pw != confirm.get():
+                    return messagebox.showerror("Prijava", "Lozinke se ne podudaraju.", parent=w)
+                salt = secrets.token_bytes(16)
+                derived = _password_key(pw, salt)
+                data_key = Fernet.generate_key()
+                wrapped_key = Fernet(derived).encrypt(data_key).decode("ascii")
+                _write_security({
+                    "version": 1, "username": u,
+                    "salt": base64.b64encode(salt).decode("ascii"),
+                    "password_verifier": hashlib.sha256(derived).hexdigest(),
+                    "wrapped_data_key": wrapped_key
+                })
+            else:
+                salt = base64.b64decode(security["salt"])
+                derived = _password_key(pw, salt)
+                if u != security.get("username"):
+                    return messagebox.showerror("Prijava", "Pogrešno korisničko ime ili lozinka.", parent=w)
+                expected = security.get("password_verifier", "")
+                if not secrets.compare_digest(hashlib.sha256(derived).hexdigest(), expected):
+                    return messagebox.showerror("Prijava", "Pogrešno korisničko ime ili lozinka.", parent=w)
+                data_key = Fernet(derived).decrypt(security["wrapped_data_key"].encode("ascii"))
+            result["fernet"] = Fernet(data_key)
+            result["username"] = u
+            w.destroy()
+        except Exception as exc:
+            messagebox.showerror("Sigurnost", f"Nije moguće pokrenuti sigurnu sesiju.\n\n{exc}", parent=w)
+
+    tk.Button(w, text="Kreiraj nalog" if first_run else "Prijavi se", command=ok,
+              bg="#cde9dc", fg=TEXT, bd=0, font=("Segoe UI", 10, "bold"), padx=18, pady=7).grid(
+        row=button_row + 1, column=0, columnspan=2, pady=(0, 4))
+    pe.bind("<Return>", lambda e: ok())
+    pe.focus_set()
+    parent.wait_window(w)
+    return result["fernet"], result["username"]
+
+
+def load(fernet):
+    """Učitava enkriptovani dnevnik; podržava jednokratnu migraciju starog JSON-a."""
+    if os.path.exists(FILE):
+        with open(FILE, "rb") as f:
+            token = f.read()
+        try:
+            return json.loads(fernet.decrypt(token).decode("utf-8"))
+        except Exception:
+            raise RuntimeError("Dnevnik je zaključan ili oštećen. Podaci nisu učitani.")
+    if os.path.exists(LEGACY_FILE):
+        try:
+            with open(LEGACY_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            # Podaci se odmah nakon uspješnog učitavanja upisuju u enkriptovani fajl.
+            return data
+        except Exception:
+            pass
+    return json.loads(json.dumps(DEFAULT))
 
 
 
@@ -407,7 +532,17 @@ class App(tk.Tk):
         self.title("Pedagog Asistent")
         self.geometry("1120x620")
         self.configure(bg=BG)
-        self.data = load()
+        self.withdraw()
+        try:
+            self.fernet, self.username = setup_or_login(self)
+        except RuntimeError as exc:
+            messagebox.showerror("Sigurnost", str(exc), parent=self)
+            self.destroy()
+            return
+        if self.fernet is None:
+            self.destroy()
+            return
+        self.data = load(self.fernet)
         self.data.setdefault("reminders", [])  # stariji fajlovi još nemaju podsjetnike
         self.data.setdefault("statuses", dict(DEFAULT_STATUSES))  # ni statuse osoba
         self.data.setdefault("trash", [])  # ni kantu za smeće
@@ -418,11 +553,22 @@ class App(tk.Tk):
         self.refresh()
         self.after(1500, self.check_reminders)  # počni provjeru podsjetnika
         self.setup_shortcuts()  # poveži prečice na tastaturi
+        self.deiconify()
 
-    # Čuva sve unose i tipove u school_log.json (poziva se nakon svake promjene).
+    # Čuva cijeli dnevnik enkriptovan, tako da sam fajl nije čitljiv kao običan JSON.
     def save(self):
-        with open(FILE, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
+        raw = json.dumps(self.data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        token = self.fernet.encrypt(raw)
+        tmp = FILE + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(token)
+        os.replace(tmp, FILE)
+        # Ako je ovo bila migracija starog JSON-a, ukloni njegovu aktivnu plaintext kopiju.
+        if os.path.exists(LEGACY_FILE):
+            try:
+                os.remove(LEGACY_FILE)
+            except OSError:
+                pass
 
     # Pravi sigurnosnu kopiju dnevnika i zakona/pravilnika u izabrani folder.
     def backup_data(self):
@@ -434,7 +580,8 @@ class App(tk.Tk):
         os.makedirs(backup_dir, exist_ok=True)
 
         copied = []
-        for path in (FILE, LAWS_FILE):
+        # Backup dnevnika ostaje enkriptovan; bez sigurnosnog ključa ne može se pročitati.
+        for path in (FILE, SECURITY_FILE, LAWS_FILE):
             if os.path.exists(path):
                 shutil.copy2(path, os.path.join(backup_dir, os.path.basename(path)))
                 copied.append(os.path.basename(path))
@@ -451,40 +598,35 @@ class App(tk.Tk):
     # Vraća dnevnik iz ranije sigurnosne kopije; prije toga čuva trenutni fajl.
     def restore_data(self):
         path = filedialog.askopenfilename(
-            title="Choose school_log.json backup",
-            filetypes=[("Pedagog Asistent data", "school_log.json"), ("JSON files", "*.json"), ("All files", "*.*")]
-        )
+            title="Choose encrypted Pedagog Asistent backup",
+            filetypes=[("Pedagog Asistent encrypted data", "*.ped"), ("All files", "*.*")],
+            parent=self)
         if not path:
             return
-
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                restored = json.load(f)
+            with open(path, "rb") as f:
+                token = f.read()
+            restored = json.loads(self.fernet.decrypt(token).decode("utf-8"))
             if not isinstance(restored, dict) or "entries" not in restored:
-                raise ValueError("Selected file is not a valid Pedagog Asistent backup.")
+                raise ValueError("Selected file is not a valid encrypted Pedagog Asistent backup.")
         except Exception as exc:
-            messagebox.showerror("Restore", f"Backup nije moguće učitati.\\n\\n{exc}", parent=self)
+            messagebox.showerror("Restore", f"Backup nije moguće otvoriti ovom prijavom.\n\n{exc}", parent=self)
             return
-
         if not messagebox.askyesno(
-            "Restore backup",
-            "Ovo će zamijeniti trenutni dnevnik podacima iz backup-a.\\n\\nNastaviti?",
-            parent=self
-        ):
+                "Restore backup",
+                "Ovo će zamijeniti trenutni dnevnik podacima iz backup-a.\n\nNastaviti?",
+                parent=self):
             return
-
-        # Automatski sačuvaj trenutni dnevnik prije vraćanja starog.
         if os.path.exists(FILE):
             stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             shutil.copy2(FILE, f"{FILE}.before_restore_{stamp}.bak")
-
         self.data = restored
         self.data.setdefault("reminders", [])
         self.data.setdefault("statuses", dict(DEFAULT_STATUSES))
         self.data.setdefault("trash", [])
         self.save()
         self.refresh()
-        messagebox.showinfo("Restore", "Dnevnik je uspješno vraćen iz backup-a.", parent=self)
+        messagebox.showinfo("Restore", "Dnevnik je uspješno vraćen iz enkriptovanog backup-a.", parent=self)
 
     # Boje i izgled tabele (naslovi kolona, označeni red).
     def style_setup(self):
