@@ -50,13 +50,93 @@ try:  # optional: only needed to import PDF files into Laws & Regulations
 except ImportError:
     pypdf = None
 
-# --- PUTANJE DO FAJLOVA SA PODACIMA (oba su u korisničkom folderu) ---
+# --- PUTANJE DO FAJLOVA SA PODACIMA ---
+# Svi podaci su u posebnom folderu aplikacije (ne više razbacani po korisničkom folderu):
+#   Windows: %APPDATA%\PedagogAsistent
+#   macOS:   ~/Library/Application Support/PedagogAsistent
+#   Linux:   ~/.local/share/PedagogAsistent
+def _app_data_dir():
+    home = os.path.expanduser("~")
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or os.path.join(home, "AppData", "Roaming")
+    elif sys.platform == "darwin":
+        base = os.path.join(home, "Library", "Application Support")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.join(home, ".local", "share")
+    return os.path.join(base, "PedagogAsistent")
+
+
+APP_DIR = _app_data_dir()
+try:
+    os.makedirs(APP_DIR, exist_ok=True)
+    if sys.platform != "win32":
+        os.chmod(APP_DIR, 0o700)  # samo vlasnik smije čitati folder
+except OSError:
+    pass
+
 # Ovdje su unosi i tipovi događaja:
-FILE = os.path.join(os.path.expanduser("~"), "school_log.ped")
-LEGACY_FILE = os.path.join(os.path.expanduser("~"), "school_log.json")
-SECURITY_FILE = os.path.join(os.path.expanduser("~"), "pedagog_asistent_security.json")
+FILE = os.path.join(APP_DIR, "school_log.ped")
+LEGACY_FILE = os.path.join(APP_DIR, "school_log.json")
+SECURITY_FILE = os.path.join(APP_DIR, "pedagog_asistent_security.json")
 # Ovdje je tekst zakona i pravilnika:
-LAWS_FILE = os.path.join(os.path.expanduser("~"), "pedagog_asistent_laws.json")
+LAWS_FILE = os.path.join(APP_DIR, "pedagog_asistent_laws.json")
+SETTINGS_FILE = os.path.join(APP_DIR, "pedagog_asistent_settings.json")
+ACTIVITY_FILE = os.path.join(APP_DIR, "pedagog_asistent_activity.json")
+AUTO_BACKUP_DIR = os.path.join(APP_DIR, "AutoBackup")
+
+
+def migrate_old_data():
+    """Jednokratno prebacuje podatke iz starog mjesta (korisnički folder) u APP_DIR.
+
+    Sigurno: prvo se kopiraju svi fajlovi, provjeri se veličina, i tek onda se brišu originali.
+    Ako išta pođe po zlu, originali ostaju na starom mjestu. Postojeći fajlovi se nikad ne prepisuju."""
+    home = os.path.expanduser("~")
+    # Sigurnosni fajl ide prvi: bez njega se enkriptovani dnevnik ne može otvoriti.
+    pairs = [("pedagog_asistent_security.json", SECURITY_FILE), ("school_log.ped", FILE),
+             ("school_log.json", LEGACY_FILE), ("pedagog_asistent_laws.json", LAWS_FILE),
+             ("pedagog_asistent_settings.json", SETTINGS_FILE), ("pedagog_asistent_activity.json", ACTIVITY_FILE)]
+    copied = []
+    try:
+        for old_name, new_path in pairs:
+            old_path = os.path.join(home, old_name)
+            if os.path.isfile(old_path) and not os.path.exists(new_path):
+                shutil.copy2(old_path, new_path)
+                copied.append((old_path, new_path))
+                if os.path.getsize(old_path) != os.path.getsize(new_path):
+                    raise OSError("Kopija nije potpuna")
+    except OSError:
+        for _old, new in copied:  # poništi: ostaje sve kako je bilo
+            try: os.remove(new)
+            except OSError: pass
+        return []
+    for old_path, _new in copied:
+        try: os.remove(old_path)
+        except OSError: pass
+    old_backup = os.path.join(home, "Pedagog_Asistent_AutoBackup")
+    if os.path.isdir(old_backup) and not os.path.exists(AUTO_BACKUP_DIR):
+        try: shutil.move(old_backup, AUTO_BACKUP_DIR)
+        except OSError: pass
+    return [os.path.basename(o) for o, _n in copied]
+
+
+def read_app_settings():
+    defaults = {"auto_backup": True, "backup_interval_minutes": 60, "idle_lock_minutes": 10,
+                "failed_attempt_limit": 5, "lockout_seconds": 30}
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            saved = json.load(f)
+        if isinstance(saved, dict): defaults.update(saved)
+    except (OSError, ValueError, TypeError):
+        pass
+    return defaults
+
+
+def write_app_settings(settings):
+    tmp = SETTINGS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f: json.dump(settings, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, SETTINGS_FILE)
+
+
 
 
 
@@ -238,13 +318,153 @@ def _write_security(obj):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2)
     os.replace(tmp, SECURITY_FILE)
+    if sys.platform != "win32":
+        try: os.chmod(SECURITY_FILE, 0o600)
+        except OSError: pass
+
+
+MIN_PASSWORD_LEN = 8
+
+
+def _b64(raw):
+    return base64.b64encode(raw).decode("ascii")
+
+
+def new_recovery_key():
+    """Ključ za oporavak: 160 nasumičnih bitova, ispisan kao XXXX-XXXX-... (32 znaka)."""
+    raw = base64.b32encode(secrets.token_bytes(20)).decode("ascii")
+    return "-".join(raw[i:i + 4] for i in range(0, len(raw), 4))
+
+
+def _clean_recovery_key(text):
+    return re.sub(r"[^A-Z2-7]", "", (text or "").upper())
+
+
+def _wrap_for_password(data_key, password):
+    """Zaključa ključ za podatke lozinkom (novi salt svaki put)."""
+    salt = secrets.token_bytes(16)
+    derived = _password_key(password, salt)
+    return {"salt": _b64(salt), "password_verifier": hashlib.sha256(derived).hexdigest(),
+            "wrapped_data_key": Fernet(derived).encrypt(data_key).decode("ascii")}
+
+
+def _wrap_for_recovery(data_key, recovery_key):
+    """Zaključa isti ključ za podatke i ključem za oporavak."""
+    salt = secrets.token_bytes(16)
+    derived = _password_key(_clean_recovery_key(recovery_key), salt)
+    return {"recovery_salt": _b64(salt),
+            "recovery_wrapped_key": Fernet(derived).encrypt(data_key).decode("ascii")}
+
+
+def verify_password(security, password):
+    try:
+        derived = _password_key(password, base64.b64decode(security["salt"]))
+        return secrets.compare_digest(hashlib.sha256(derived).hexdigest(), security.get("password_verifier", ""))
+    except Exception:
+        return False
+
+
+def unwrap_with_recovery(security, recovery_key):
+    """Vraća ključ za podatke ili baca grešku ako je ključ za oporavak pogrešan."""
+    derived = _password_key(_clean_recovery_key(recovery_key), base64.b64decode(security["recovery_salt"]))
+    return Fernet(derived).decrypt(security["recovery_wrapped_key"].encode("ascii"))
+
+
+def security_with_new_password(security, data_key, new_password):
+    """Nova lozinka: dnevnik se ne šifruje ponovo, samo se ključ zaključa novom lozinkom."""
+    new = dict(security)
+    new.update(_wrap_for_password(data_key, new_password))
+    new["version"] = 2
+    return new
+
+
+def security_with_new_recovery(security, data_key, recovery_key):
+    new = dict(security)
+    new.update(_wrap_for_recovery(data_key, recovery_key))
+    new["version"] = 2
+    return new
+
+
+def show_recovery_key_dialog(parent, key):
+    """Prikazuje ključ za oporavak. Ne može se zatvoriti dok korisnik ne potvrdi da ga je sačuvao."""
+    d = tk.Toplevel(parent)
+    d.title("Ključ za oporavak")
+    d.configure(bg=BG, padx=28, pady=22)
+    d.resizable(False, False)
+    d.transient(parent)
+    d.protocol("WM_DELETE_WINDOW", lambda: None)
+    tk.Label(d, text="🛟 Ključ za oporavak", bg=BG, fg=TEXT, font=("Segoe UI", 16, "bold")).grid(row=0, column=0, columnspan=2, pady=(0, 10))
+    tk.Label(d, text=("Ako zaboravite lozinku, ovo je JEDINI način da otvorite dnevnik. Prikazuje se samo jednom.\n"
+                      "Zapišite ga na papir ili ga sačuvajte van ovog računara (npr. na USB). "
+                      "Ko ima ovaj ključ, može otvoriti dnevnik."),
+             bg=BG, fg="#806b79", wraplength=430, justify="left").grid(row=1, column=0, columnspan=2, pady=(0, 12))
+    e = tk.Entry(d, width=40, font=("Consolas", 13, "bold"), justify="center", relief="flat")
+    e.insert(0, key)
+    e.config(state="readonly")
+    e.grid(row=2, column=0, columnspan=2, pady=(0, 10), ipady=6)
+    confirmed = tk.BooleanVar(value=False)
+    done = tk.Button(d, text="Nastavi", state="disabled", bg="#cde9dc", fg=TEXT, bd=0,
+                     font=("Segoe UI", 10, "bold"), padx=18, pady=7, command=d.destroy)
+
+    def copy_key():
+        d.clipboard_clear()
+        d.clipboard_append(key)
+        copy_btn.config(text="Kopirano ✓")
+    copy_btn = tk.Button(d, text="Kopiraj", command=copy_key, bg=CARD, fg=TEXT, bd=0, padx=14, pady=6)
+    copy_btn.grid(row=3, column=0, columnspan=2, pady=(0, 10))
+    tk.Checkbutton(d, text="Sačuvao/la sam ključ na sigurnom mjestu", variable=confirmed, bg=BG, fg=TEXT,
+                   command=lambda: done.config(state="normal" if confirmed.get() else "disabled")
+                   ).grid(row=4, column=0, columnspan=2, pady=(0, 10))
+    done.grid(row=5, column=0, columnspan=2)
+    d.grab_set()
+    parent.wait_window(d)
+
+
+def recovery_reset_dialog(parent, security):
+    """Zaboravljena lozinka: ključ za oporavak + nova lozinka. Vraća ključ za podatke ili None."""
+    out = {"data_key": None}
+    d = tk.Toplevel(parent)
+    d.title("Oporavak pristupa")
+    d.configure(bg=BG, padx=26, pady=22)
+    d.resizable(False, False)
+    d.transient(parent)
+    tk.Label(d, text="🛟 Oporavak pristupa", bg=BG, fg=TEXT, font=("Segoe UI", 16, "bold")).grid(row=0, column=0, columnspan=2, pady=(0, 12))
+    fields = [("Ključ za oporavak", False), ("Nova lozinka", True), ("Ponovi novu lozinku", True)]
+    vars_ = []
+    for i, (label, secret) in enumerate(fields, start=1):
+        tk.Label(d, text=label, bg=BG, fg=TEXT).grid(row=i, column=0, sticky="w", pady=5, padx=(0, 10))
+        var = tk.StringVar()
+        vars_.append(var)
+        tk.Entry(d, textvariable=var, width=36, show="•" if secret else "", relief="flat").grid(row=i, column=1, pady=5)
+
+    def ok():
+        key, pw, rep_pw = (v.get() for v in vars_)
+        if len(pw) < MIN_PASSWORD_LEN:
+            return messagebox.showerror("Oporavak", f"Nova lozinka mora imati najmanje {MIN_PASSWORD_LEN} znakova.", parent=d)
+        if pw != rep_pw:
+            return messagebox.showerror("Oporavak", "Lozinke se ne podudaraju.", parent=d)
+        try:
+            data_key = unwrap_with_recovery(security, key)
+        except Exception:
+            return messagebox.showerror("Oporavak", "Pogrešan ključ za oporavak.", parent=d)
+        try:
+            _write_security(security_with_new_password(security, data_key, pw))
+        except OSError as exc:
+            return messagebox.showerror("Oporavak", f"Nova lozinka nije sačuvana.\n\n{exc}", parent=d)
+        out["data_key"] = data_key
+        d.destroy()
+    tk.Button(d, text="Postavi novu lozinku", command=ok, bg="#cde9dc", fg=TEXT, bd=0,
+              font=("Segoe UI", 10, "bold"), padx=18, pady=7).grid(row=4, column=0, columnspan=2, pady=(12, 0))
+    d.grab_set()
+    parent.wait_window(d)
+    return out["data_key"]
 
 
 def setup_or_login(parent):
-    """Prikaže login/setup. Vraća Fernet objekt za sesiju ili None."""
+    """Prikaže login/setup. Vraća (Fernet, korisničko ime, ključ za podatke); Fernet je None ako je prijava otkazana."""
     _require_crypto()
     security = _read_security()
-    result = {"fernet": None, "username": None}
+    result = {"fernet": None, "username": None, "data_key": None}
     w = tk.Toplevel(parent)
     w.title("Pedagog Asistent – prijava")
     w.configure(bg=BG, padx=28, pady=24)
@@ -253,6 +473,7 @@ def setup_or_login(parent):
     w.grab_set()
 
     first_run = security is None
+    failed_attempts = {"count": 0, "blocked_until": 0.0}
     title = "Kreiranje naloga" if first_run else "Prijava u Pedagog Asistent"
     tk.Label(w, text="🔐 " + title, bg=BG, fg=TEXT, font=("Segoe UI", 17, "bold")).grid(
         row=0, column=0, columnspan=2, pady=(0, 16))
@@ -276,23 +497,26 @@ def setup_or_login(parent):
         row=button_row, column=0, columnspan=2, pady=(10, 12))
 
     def ok():
+        import time
+        settings = read_app_settings()
+        now = time.monotonic()
+        if now < failed_attempts["blocked_until"]:
+            left = int(failed_attempts["blocked_until"] - now) + 1
+            return messagebox.showwarning("Privremeno zaključano", f"Previše neuspješnih pokušaja. Pokušajte za {left} s.", parent=w)
         u, pw = username.get().strip(), password.get()
-        if not u or len(pw) < 8:
-            return messagebox.showerror("Prijava", "Unesite korisničko ime i lozinku od najmanje 8 znakova.", parent=w)
+        if not u or len(pw) < MIN_PASSWORD_LEN:
+            return messagebox.showerror("Prijava", f"Unesite korisničko ime i lozinku od najmanje {MIN_PASSWORD_LEN} znakova.", parent=w)
+        new_recovery = None
         try:
             if first_run:
                 if pw != confirm.get():
                     return messagebox.showerror("Prijava", "Lozinke se ne podudaraju.", parent=w)
-                salt = secrets.token_bytes(16)
-                derived = _password_key(pw, salt)
                 data_key = Fernet.generate_key()
-                wrapped_key = Fernet(derived).encrypt(data_key).decode("ascii")
-                _write_security({
-                    "version": 1, "username": u,
-                    "salt": base64.b64encode(salt).decode("ascii"),
-                    "password_verifier": hashlib.sha256(derived).hexdigest(),
-                    "wrapped_data_key": wrapped_key
-                })
+                new_recovery = new_recovery_key()
+                sec = {"version": 2, "username": u}
+                sec.update(_wrap_for_password(data_key, pw))
+                sec.update(_wrap_for_recovery(data_key, new_recovery))
+                _write_security(sec)
             else:
                 salt = base64.b64decode(security["salt"])
                 derived = _password_key(pw, salt)
@@ -300,10 +524,19 @@ def setup_or_login(parent):
                     return messagebox.showerror("Prijava", "Pogrešno korisničko ime ili lozinka.", parent=w)
                 expected = security.get("password_verifier", "")
                 if not secrets.compare_digest(hashlib.sha256(derived).hexdigest(), expected):
+                    failed_attempts["count"] += 1
+                    limit = max(3, int(settings.get("failed_attempt_limit", 5)))
+                    if failed_attempts["count"] >= limit:
+                        failed_attempts["blocked_until"] = time.monotonic() + max(10, int(settings.get("lockout_seconds", 30)))
+                        failed_attempts["count"] = 0
                     return messagebox.showerror("Prijava", "Pogrešno korisničko ime ili lozinka.", parent=w)
+                failed_attempts["count"] = 0
                 data_key = Fernet(derived).decrypt(security["wrapped_data_key"].encode("ascii"))
             result["fernet"] = Fernet(data_key)
             result["username"] = u
+            result["data_key"] = data_key
+            if new_recovery:
+                show_recovery_key_dialog(w, new_recovery)  # prikaže se samo jednom, pri kreiranju naloga
             w.destroy()
         except Exception as exc:
             messagebox.showerror("Sigurnost", f"Nije moguće pokrenuti sigurnu sesiju.\n\n{exc}", parent=w)
@@ -311,10 +544,29 @@ def setup_or_login(parent):
     tk.Button(w, text="Kreiraj nalog" if first_run else "Prijavi se", command=ok,
               bg="#cde9dc", fg=TEXT, bd=0, font=("Segoe UI", 10, "bold"), padx=18, pady=7).grid(
         row=button_row + 1, column=0, columnspan=2, pady=(0, 4))
+
+    def recover():
+        if not security.get("recovery_wrapped_key"):
+            return messagebox.showinfo("Oporavak", "Za ovaj nalog ključ za oporavak nije napravljen.\n"
+                                       "Možete ga napraviti nakon prijave: Other → New recovery key.", parent=w)
+        data_key = recovery_reset_dialog(w, security)
+        if data_key is None:
+            w.grab_set()  # dijalog je preuzeo fokus; vrati ga na prijavu
+            return
+        messagebox.showinfo("Oporavak", "Lozinka je promijenjena. Sada ste prijavljeni.", parent=w)
+        result["fernet"] = Fernet(data_key)
+        result["username"] = security.get("username")
+        result["data_key"] = data_key
+        w.destroy()
+
+    if not first_run:
+        tk.Button(w, text="Zaboravljena lozinka? Koristi ključ za oporavak", command=recover, bg=BG, fg="#806b79",
+                  bd=0, cursor="hand2", font=("Segoe UI", 9, "underline"), activebackground=BG).grid(
+            row=button_row + 2, column=0, columnspan=2, pady=(6, 0))
     pe.bind("<Return>", lambda e: ok())
     pe.focus_set()
     parent.wait_window(w)
-    return result["fernet"], result["username"]
+    return result["fernet"], result["username"], result["data_key"]
 
 
 def load(fernet):
@@ -533,8 +785,9 @@ class App(tk.Tk):
         self.geometry("1120x620")
         self.configure(bg=BG)
         self.withdraw()
+        self.locked = False
         try:
-            self.fernet, self.username = setup_or_login(self)
+            self.fernet, self.username, self.data_key = setup_or_login(self)
         except RuntimeError as exc:
             messagebox.showerror("Sigurnost", str(exc), parent=self)
             self.destroy()
@@ -542,10 +795,19 @@ class App(tk.Tk):
         if self.fernet is None:
             self.destroy()
             return
-        self.data = load(self.fernet)
-        self.data.setdefault("reminders", [])  # stariji fajlovi još nemaju podsjetnike
-        self.data.setdefault("statuses", dict(DEFAULT_STATUSES))  # ni statuse osoba
-        self.data.setdefault("trash", [])  # ni kantu za smeće
+        try:
+            self.data = self._read_data()
+        except RuntimeError as exc:
+            messagebox.showerror("Podaci", str(exc), parent=self)
+            self.destroy()
+            return
+        self.settings = read_app_settings()
+        self._last_activity = datetime.now().timestamp()
+        self._last_auto_backup = 0.0
+        self._activity_guard = False
+        self.bind_all("<Key>", self._touch_activity, add="+")
+        self.bind_all("<Button>", self._touch_activity, add="+")
+        self._schedule_security_checks()
         self.purge_trash()  # trajno ukloni unose koji su u kanti predugo
         self.cur = date.today()
         self.style_setup()
@@ -555,20 +817,248 @@ class App(tk.Tk):
         self.setup_shortcuts()  # poveži prečice na tastaturi
         self.deiconify()
 
+    # Učitava dnevnik sa diska i dopunjuje polja koja stariji fajlovi još nemaju.
+    def _read_data(self):
+        data = load(self.fernet)
+        data.setdefault("reminders", [])  # stariji fajlovi još nemaju podsjetnike
+        data.setdefault("statuses", dict(DEFAULT_STATUSES))  # ni statuse osoba
+        data.setdefault("trash", [])  # ni kantu za smeće
+        return data
+
     # Čuva cijeli dnevnik enkriptovan, tako da sam fajl nije čitljiv kao običan JSON.
     def save(self):
+        if self.fernet is None:  # aplikacija je zaključana: ključa nema, pa nema ni čuvanja
+            return
         raw = json.dumps(self.data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         token = self.fernet.encrypt(raw)
         tmp = FILE + ".tmp"
         with open(tmp, "wb") as f:
             f.write(token)
         os.replace(tmp, FILE)
+        self.log_activity("Čuvanje podataka")
+        self._maybe_auto_backup()
         # Ako je ovo bila migracija starog JSON-a, ukloni njegovu aktivnu plaintext kopiju.
         if os.path.exists(LEGACY_FILE):
             try:
                 os.remove(LEGACY_FILE)
             except OSError:
                 pass
+
+    def log_activity(self, action):
+        """Bilježi samo metapodatke aktivnosti, nikad tekst dnevnika ili lozinke."""
+        try:
+            try:
+                with open(ACTIVITY_FILE, encoding="utf-8") as f: events = json.load(f)
+                if not isinstance(events, list): events = []
+            except (OSError, ValueError): events = []
+            events.append({"time": datetime.now().isoformat(timespec="seconds"),
+                           "user": getattr(self, "username", ""), "action": str(action)[:120]})
+            events = events[-2000:]
+            tmp = ACTIVITY_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f: json.dump(events, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, ACTIVITY_FILE)
+        except OSError:
+            pass
+
+    def _maybe_auto_backup(self):
+        import time
+        if not getattr(self, "settings", {}).get("auto_backup", True): return
+        now = time.time()
+        interval = max(5, int(self.settings.get("backup_interval_minutes", 60))) * 60
+        if now - getattr(self, "_last_auto_backup", 0) < interval: return
+        try:
+            os.makedirs(AUTO_BACKUP_DIR, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            for path in (FILE, SECURITY_FILE, LAWS_FILE):
+                if os.path.isfile(path): shutil.copy2(path, os.path.join(AUTO_BACKUP_DIR, stamp + "_" + os.path.basename(path)))
+            # Čuvaj posljednjih 30 kopija po vrsti; sigurnosni fajlovi se kopiraju zajedno po vremenskoj oznaci.
+            files = sorted((os.path.join(AUTO_BACKUP_DIR, x) for x in os.listdir(AUTO_BACKUP_DIR)), key=os.path.getmtime, reverse=True)
+            for old in files[90:]:
+                try: os.remove(old)
+                except OSError: pass
+            self._last_auto_backup = now
+        except OSError:
+            self.log_activity("Automatski backup nije uspio")
+
+    def _touch_activity(self, event=None):
+        self._last_activity = datetime.now().timestamp()
+
+    def _schedule_security_checks(self):
+        self.after(15000, self._security_tick)
+
+    def _security_tick(self):
+        if not self.winfo_exists(): return
+        timeout = max(1, int(self.settings.get("idle_lock_minutes", 10))) * 60
+        if datetime.now().timestamp() - self._last_activity >= timeout:
+            self.lock_now()
+        else:
+            self._schedule_security_checks()
+
+    # Pravo zaključavanje: čuva podatke, zatvara SVE prozore, briše ključ i podatke iz memorije
+    # i prazni tabelu. Tek nakon ponovne prijave podaci se opet učitaju sa diska.
+    def lock_now(self):
+        if getattr(self, "_activity_guard", False): return
+        self._activity_guard = True
+        self.log_activity("Zaključavanje aplikacije")
+        try:
+            try:
+                self.save()  # ništa se ne smije izgubiti kad se podaci izbace iz memorije
+            except Exception:
+                pass
+            self.locked = True
+            # Zatvori sve pomoćne prozore (podsjetnici, kanta, zakoni, izvještaj, iskočni podsjetnici...).
+            for child in list(self.winfo_children()):
+                if isinstance(child, tk.Toplevel):
+                    try: child.destroy()
+                    except tk.TclError: pass
+            # Isprazni ono što glavni prozor prikazuje.
+            self.tree.delete(*self.tree.get_children())
+            self.total.config(text="")
+            self.day_lbl.config(text="")
+            # Ukloni ključ i podatke iz memorije (Python ne može garantovati brisanje, ali ne drži reference).
+            self.fernet = None
+            self.data_key = None
+            self.data = {"entries": [], "types": {}, "reminders": [], "statuses": {}, "trash": []}
+            import gc; gc.collect()
+            self.withdraw()
+            fernet, username, data_key = setup_or_login(self)
+            if fernet is None:
+                self.destroy(); return
+            self.fernet, self.username, self.data_key = fernet, username, data_key
+            try:
+                self.data = self._read_data()
+            except RuntimeError as exc:
+                messagebox.showerror("Podaci", str(exc), parent=self)
+                self.destroy(); return
+            self.locked = False
+            self._last_activity = datetime.now().timestamp()
+            self.refresh()
+            self.deiconify()
+            self.log_activity("Ponovna prijava uspješna")
+        finally:
+            self._activity_guard = False
+        if self.winfo_exists(): self._schedule_security_checks()
+
+    # Provjerava trenutnu lozinku (koristi se prije promjene lozinke i pravljenja novog ključa za oporavak).
+    def _verify_current_password(self, password):
+        security = _read_security()
+        return bool(security) and verify_password(security, password)
+
+    # Promjena lozinke: dnevnik se ne šifruje ponovo, samo se ključ za podatke zaključa novom lozinkom.
+    def change_password(self):
+        if self.fernet is None: return
+        w = self.popup("Promjena lozinke")
+        labels = ["Trenutna lozinka", "Nova lozinka", "Ponovi novu lozinku"]
+        vars_ = [tk.StringVar() for _ in labels]
+        for i, (label, var) in enumerate(zip(labels, vars_)):
+            tk.Label(w, text=label, bg=BG, fg=TEXT).grid(row=i, column=0, sticky="w", pady=5, padx=(0, 10))
+            tk.Entry(w, textvariable=var, show="•", width=30, relief="flat").grid(row=i, column=1, pady=5)
+        tk.Label(w, text=f"Najmanje {MIN_PASSWORD_LEN} znakova. Starije kopije (backup) i dalje se otvaraju starom lozinkom.",
+                 bg=BG, fg="#806b79", wraplength=380, justify="left").grid(row=3, column=0, columnspan=2, pady=(6, 10))
+
+        def ok():
+            cur, new, rep_pw = (v.get() for v in vars_)
+            if not self._verify_current_password(cur):
+                return messagebox.showerror("Lozinka", "Trenutna lozinka nije tačna.", parent=w)
+            if len(new) < MIN_PASSWORD_LEN:
+                return messagebox.showerror("Lozinka", f"Nova lozinka mora imati najmanje {MIN_PASSWORD_LEN} znakova.", parent=w)
+            if new != rep_pw:
+                return messagebox.showerror("Lozinka", "Nove lozinke se ne podudaraju.", parent=w)
+            if new == cur:
+                return messagebox.showerror("Lozinka", "Nova lozinka mora biti drugačija od trenutne.", parent=w)
+            try:
+                _write_security(security_with_new_password(_read_security(), self.data_key, new))
+            except (OSError, ValueError) as exc:
+                return messagebox.showerror("Lozinka", f"Lozinka nije promijenjena.\n\n{exc}", parent=w)
+            self.log_activity("Promjena lozinke")
+            w.destroy()
+            messagebox.showinfo("Lozinka", "Lozinka je promijenjena.", parent=self)
+        tk.Button(w, text="Promijeni lozinku", command=ok, bg="#cde9dc", fg=TEXT, bd=0,
+                  font=("Segoe UI", 10, "bold"), padx=18, pady=7).grid(row=4, column=0, columnspan=2)
+
+    # Pravi novi ključ za oporavak (stari prestaje da važi). Traži trenutnu lozinku.
+    def new_recovery_key(self):
+        if self.fernet is None: return
+        w = self.popup("Novi ključ za oporavak")
+        tk.Label(w, text="Stari ključ za oporavak (ako postoji) prestaje da važi.\nUnesite trenutnu lozinku da nastavite.",
+                 bg=BG, fg=TEXT, justify="left").grid(row=0, column=0, columnspan=2, pady=(0, 10))
+        pw = tk.StringVar()
+        tk.Label(w, text="Trenutna lozinka", bg=BG, fg=TEXT).grid(row=1, column=0, sticky="w", padx=(0, 10))
+        entry = tk.Entry(w, textvariable=pw, show="•", width=30, relief="flat")
+        entry.grid(row=1, column=1, pady=5)
+        entry.focus_set()
+
+        def ok():
+            if not self._verify_current_password(pw.get()):
+                return messagebox.showerror("Ključ za oporavak", "Trenutna lozinka nije tačna.", parent=w)
+            key = new_recovery_key()
+            try:
+                _write_security(security_with_new_recovery(_read_security(), self.data_key, key))
+            except (OSError, ValueError) as exc:
+                return messagebox.showerror("Ključ za oporavak", f"Ključ nije sačuvan.\n\n{exc}", parent=w)
+            self.log_activity("Novi ključ za oporavak")
+            w.destroy()
+            show_recovery_key_dialog(self, key)
+        entry.bind("<Return>", lambda e: ok())
+        tk.Button(w, text="Napravi ključ", command=ok, bg="#cde9dc", fg=TEXT, bd=0,
+                  font=("Segoe UI", 10, "bold"), padx=18, pady=7).grid(row=2, column=0, columnspan=2, pady=(10, 0))
+
+    def open_settings(self):
+        w = tk.Toplevel(self); w.title("Podešavanja"); w.configure(bg=BG, padx=18, pady=16); w.resizable(False, False)
+        auto = tk.BooleanVar(value=bool(self.settings.get("auto_backup", True)))
+        tk.Checkbutton(w, text="Automatski backup", variable=auto, bg=BG, fg=TEXT).grid(row=0,column=0,columnspan=2,sticky="w",pady=5)
+        tk.Label(w,text="Interval backupa (minuta)",bg=BG,fg=TEXT).grid(row=1,column=0,sticky="w",pady=5)
+        interval=tk.StringVar(value=str(self.settings.get("backup_interval_minutes",60)))
+        tk.Entry(w,textvariable=interval,width=10).grid(row=1,column=1,pady=5)
+        tk.Label(w,text="Zaključaj nakon neaktivnosti (minuta)",bg=BG,fg=TEXT).grid(row=2,column=0,sticky="w",pady=5)
+        idle=tk.StringVar(value=str(self.settings.get("idle_lock_minutes",10)))
+        tk.Entry(w,textvariable=idle,width=10).grid(row=2,column=1,pady=5)
+        tk.Label(w,text="Neuspješni pokušaji prije blokade",bg=BG,fg=TEXT).grid(row=3,column=0,sticky="w",pady=5)
+        attempts=tk.StringVar(value=str(self.settings.get("failed_attempt_limit",5)))
+        tk.Entry(w,textvariable=attempts,width=10).grid(row=3,column=1,pady=5)
+        def save_settings():
+            try:
+                self.settings.update({"auto_backup":auto.get(),"backup_interval_minutes":max(5,int(interval.get())),"idle_lock_minutes":max(1,int(idle.get())),"failed_attempt_limit":max(3,int(attempts.get()))})
+                write_app_settings(self.settings); self.log_activity("Promjena podešavanja")
+                messagebox.showinfo("Podešavanja","Podešavanja su sačuvana.",parent=w); w.destroy()
+            except ValueError: messagebox.showerror("Podešavanja","Unesite ispravne cijele brojeve.",parent=w)
+        self.btn(w,"Sačuvaj",save_settings,"#cde9dc").grid(row=4,column=0,columnspan=2,pady=12)
+
+    def import_export_data(self):
+        choice = messagebox.askyesnocancel("Izvoz / uvoz", "Da — izvezi enkriptovanu kopiju dnevnika.\nNe — uvezi enkriptovanu kopiju.\nOtkaži — bez promjene.", parent=self)
+        if choice is None: return
+        if choice:
+            path=filedialog.asksaveasfilename(parent=self,title="Izvezi enkriptovani dnevnik",defaultextension=".ped",filetypes=[("Enkriptovani dnevnik","*.ped")])
+            if not path:return
+            try:
+                self.save()
+                shutil.copy2(FILE,path); self.log_activity("Izvoz enkriptovanih podataka")
+                messagebox.showinfo("Izvoz","Enkriptovani dnevnik je izvezen. Za otvaranje na drugom računaru potrebni su odgovarajući sigurnosni podaci.",parent=self)
+            except OSError as exc: messagebox.showerror("Izvoz",str(exc),parent=self)
+        else:
+            path=filedialog.askopenfilename(parent=self,title="Uvezi enkriptovani dnevnik",filetypes=[("Enkriptovani dnevnik","*.ped")])
+            if not path:return
+            try:
+                with open(path,"rb") as f: restored=json.loads(self.fernet.decrypt(f.read()).decode("utf-8"))
+                if not isinstance(restored,dict) or not isinstance(restored.get("entries"),list): raise ValueError("Neispravan format dnevnika.")
+                if not messagebox.askyesno("Potvrda uvoza","Uvoz će zamijeniti trenutne podatke. Prije toga će biti sačuvana kopija. Nastaviti?",parent=self):return
+                if os.path.exists(FILE): shutil.copy2(FILE,FILE+".before_import_"+datetime.now().strftime("%Y%m%d_%H%M%S")+".bak")
+                self.data=restored
+                self.data.setdefault("reminders",[]); self.data.setdefault("statuses",dict(DEFAULT_STATUSES)); self.data.setdefault("trash",[])
+                self.save(); self.refresh(); self.log_activity("Uvoz enkriptovanih podataka")
+                messagebox.showinfo("Uvoz","Podaci su uspješno uvezeni.",parent=self)
+            except Exception as exc: messagebox.showerror("Uvoz","Uvoz nije uspio. Provjerite da li fajl pripada ovom nalogu.\n\n"+str(exc),parent=self)
+
+    def show_activity(self):
+        w=tk.Toplevel(self); w.title("Evidencija aktivnosti"); w.geometry("760x480"); w.configure(bg=BG)
+        tree=ttk.Treeview(w,columns=("time","user","action"),show="headings")
+        for col,label,width in (("time","Vrijeme",180),("user","Korisnik",130),("action","Aktivnost",400)):
+            tree.heading(col,text=label); tree.column(col,width=width,anchor="w")
+        tree.pack(fill="both",expand=True,padx=12,pady=12)
+        try:
+            with open(ACTIVITY_FILE,encoding="utf-8") as f: events=json.load(f)
+            for e in reversed(events[-1000:]): tree.insert("","end",values=(e.get("time",""),e.get("user",""),e.get("action","")))
+        except (OSError,ValueError): pass
 
     # Pravi sigurnosnu kopiju dnevnika i zakona/pravilnika u izabrani folder.
     def backup_data(self):
@@ -646,6 +1136,23 @@ class App(tk.Tk):
         b.pack(side=side, padx=4)
         return b
 
+    # Otvara zajednički meni za pomoćne radnje.
+    def open_other_menu(self, button):
+        menu = tk.Menu(self, tearoff=0, bg=CARD, fg=TEXT,
+                       activebackground=SEL, activeforeground=TEXT,
+                       font=("Segoe UI", 10))
+        menu.add_command(label="💾 Save", command=self.save)
+        menu.add_command(label="🗑 Trash", command=self.open_trash)
+        menu.add_command(label="💾 Backup", command=self.backup_data)
+        menu.add_command(label="↩ Restore", command=self.restore_data)
+        menu.add_command(label="📋 Activity", command=self.show_activity)
+        menu.add_command(label="⇄ Export / Import", command=self.import_export_data)
+        menu.add_separator()
+        menu.add_command(label="🔑 Change password", command=self.change_password)
+        menu.add_command(label="🛟 New recovery key", command=self.new_recovery_key)
+        menu.add_command(label="🔒 Lock", command=self.lock_now)
+        menu.tk_popup(button.winfo_rootx(), button.winfo_rooty() + button.winfo_height())
+
     # Gradi izgled glavnog prozora, odozgo prema dolje.
     def build(self):
         # Naslov aplikacije i datum koji je trenutno otvoren
@@ -701,9 +1208,8 @@ class App(tk.Tk):
         foot.pack(pady=(0, 4))
         self.btn(foot, "📄  End of day – save report as PDF", self.export_pdf, "#ffe6bb")
         self.btn(foot, "🔔 Reminders", self.open_reminders, "#f0d9ef")
-        self.btn(foot, "🗑 Trash", self.open_trash, "#c4dfe5")
-        self.btn(foot, "💾 Backup", self.backup_data, "#cde9dc")
-        self.btn(foot, "↩ Restore", self.restore_data, "#e9ecce")
+        self.btn(foot, "⚙ Settings", self.open_settings, "#c4dfe5")
+        other_btn = self.btn(foot, "⋯ Other", lambda: self.open_other_menu(other_btn), "#c4dfe5")
 
         # Mali podsjetnik na najvažnije prečice (cijela lista: F1)
         k = "Cmd" if sys.platform == "darwin" else "Ctrl"
@@ -724,7 +1230,7 @@ class App(tk.Tk):
 
     # Izvršava radnju prečice, osim ako je otvoren prozor za unos (da se ne otvori novi usred pisanja).
     def run_shortcut(self, method):
-        if not self.grab_current():
+        if not self.grab_current() and not getattr(self, "locked", False):
             getattr(self, method)()
         return "break"
 
@@ -796,6 +1302,9 @@ class App(tk.Tk):
     # Svakih 20 sekundi provjerava da li je neki podsjetnik stigao na red i prikazuje ga.
     # Podsjetnik se prikaže samo jednom (označi se kao "fired"), čak i kad se aplikacija ponovo pokrene.
     def check_reminders(self):
+        if getattr(self, "locked", False):  # dok je zaključano ništa ne iskače; stiglo bi se nakon prijave
+            self.after(20000, self.check_reminders)
+            return
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         shown = 0
         for r in self.data["reminders"]:
@@ -1778,4 +2287,5 @@ class LawsWindow(tk.Toplevel):
 
 # Kad se fajl pokrene, otvara se glavni prozor.
 if __name__ == "__main__":
+    migrate_old_data()  # jednokratno: prebaci stare podatke u folder aplikacije
     App().mainloop()
