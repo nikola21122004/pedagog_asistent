@@ -1611,10 +1611,6 @@ class App(tk.Tk):
         notes.pack(side="left", fill="both", expand=True)
         sb.config(command=notes.yview)
         notes.insert("1.0", e.get("notes", ""))
-        # Dugmad sa slovima š đ č ć ž ispod bilješki (ubacuju slovo u polje u kojem ste zadnje pisali)
-        target = [notes]
-        self.track_focus(w, target)
-        self.letters_bar(w, target).grid(row=9, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         # Klik na "Done ✓": provjeri unos, sačuvaj ga i osvježi listu
         def ok():
@@ -1645,20 +1641,12 @@ class App(tk.Tk):
         # Dugme "Done ✓" (i taster Enter)
         bf = tk.Frame(w, bg=BG)
         bf.grid(row=10, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        self.btn(bf, "Cancel", w.destroy, "#fcdce1")  # zatvara prozor bez čuvanja
         self.btn(bf, "Done ✓", ok, "#cde9dc")
         w.bind("<Return>", lambda ev: ok() if ev.widget is not notes else None)
         w.bind("<Control-Return>", lambda ev: ok())  # Ctrl+Enter čuva i dok pišete bilješke
+        w.bind("<Escape>", lambda ev: w.destroy())   # taster Esc = Cancel
 
-    # Pamti u koje polje (Entry ili Text) je zadnje kliknuto u prozoru w; to polje primaju dugmad sa slovima.
-    # target je lista sa jednim elementom (polje u koje se ubacuje slovo).
-    def track_focus(self, w, target):
-        def on_focus(ev):
-            if isinstance(ev.widget, (tk.Entry, tk.Text)):
-                target[0] = ev.widget
-        w.bind("<FocusIn>", on_focus)
-
-    # Red malih dugmadi sa slovima š đ č ć ž (i velikim). Klik ubacuje slovo u polje u kojem ste zadnje pisali.
-    # Radi bez obzira na tastaturu: korisno ako Windows tastatura nema ta slova (npr. engleski raspored).
     # Mali prozor za novi status osobe (npr. "Psychologist"): ime + da li se za njega upisuju razred
     # i odjeljenje. Poslije dodavanja poziva on_done(ime); parent je prozor iz kojeg je otvoren.
     def status_dialog(self, on_done, parent=None):
@@ -1949,10 +1937,6 @@ class ReminderWindow(tk.Toplevel):
         # Kvačica: urađeno unaprijed – takav podsjetnik se neće prikazati na ekranu
         tk.Checkbutton(w, text="Already done (it will not pop up)", variable=v["done"], bg=BG, fg=TEXT,
                        activebackground=BG, selectcolor=CARD).grid(row=4, column=1, sticky="w", pady=4)
-        # Dugmad sa slovima š đ č ć ž (ubacuju slovo u polje u kojem ste zadnje pisali)
-        target = [notes]
-        self.app.track_focus(w, target)
-        self.app.letters_bar(w, target).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         # Klik na "Save ✓": provjeri unos i sačuvaj podsjetnik (ponovo se "naoruža", osim ako je urađen)
         def ok():
